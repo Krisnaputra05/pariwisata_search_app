@@ -4,24 +4,16 @@ import streamlit as st
 import io
 import re
 
-import nltk
-nltk.data.path.append("C:/Users/Lenovo/AppData/Roaming/nltk_data")
-nltk.download('punkt')
-
-from nltk.tokenize import word_tokenize
-
-
 from spellchecker import SpellChecker
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 
 from gensim.models import Word2Vec
-from keras.models import Sequential
-from keras.layers import Dense, Dropout
-
+from nltk.tokenize import word_tokenize
+import nltk
+nltk.download('punkt')
 
 # ------------------- Resource & Preprocessing -------------------
 @st.cache_resource
@@ -31,16 +23,21 @@ def get_preprocessors():
     return stemmer, stopword_remover
 
 stemmer, stopword_remover = get_preprocessors()
-spell = SpellChecker()
-
-def correct_typo(text):
-    return ' '.join([spell.correction(w) or w for w in text.split()])
 
 def preprocess(text):
-    text = correct_typo(text.lower())
+    text = text.lower()
     text = stopword_remover.remove(text)
     text = stemmer.stem(text)
     return text
+
+spell = SpellChecker()
+
+def correct_typo(text):
+    corrected = []
+    for word in text.split():
+        corrected_word = spell.correction(word)
+        corrected.append(corrected_word if corrected_word else word)
+    return ' '.join(corrected)
 
 @st.cache_data
 def load_and_clean_data():
@@ -57,11 +54,25 @@ def load_and_clean_data():
 
 df = load_and_clean_data()
 
+# ------------------- TF-IDF Variants -------------------
+tfidf_options = {
+    'Default': TfidfVectorizer(),
+    'With Bigrams': TfidfVectorizer(ngram_range=(1, 2)),
+    'Sublinear TF': TfidfVectorizer(sublinear_tf=True),
+}
+
+@st.cache_data
+def get_vectorizer_and_matrix(variant_name, corpus):
+    vectorizer = tfidf_options[variant_name]
+    matrix = vectorizer.fit_transform(corpus)
+    return vectorizer, matrix
+
 # ------------------- Word2Vec -------------------
 @st.cache_resource
 def train_word2vec(corpus):
     tokenized = [word_tokenize(text) for text in corpus]
-    return Word2Vec(sentences=tokenized, vector_size=100, window=5, min_count=2, workers=4)
+    model = Word2Vec(sentences=tokenized, vector_size=100, window=5, min_count=2, workers=4)
+    return model
 
 def document_vector(doc, model):
     tokens = [word for word in word_tokenize(doc) if word in model.wv]
@@ -69,28 +80,18 @@ def document_vector(doc, model):
         return np.zeros(model.vector_size)
     return np.mean(model.wv[tokens], axis=0)
 
-# ------------------- Deep Learning Model -------------------
-def train_embedding_model(X_train):
-    model = Sequential()
-    model.add(Dense(128, activation='relu', input_shape=(X_train.shape[1],)))
-    model.add(Dropout(0.2))
-    model.add(Dense(64, activation='relu'))
-    model.add(Dense(32, activation='relu'))  # Embedding output
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X_train, X_train, epochs=30, batch_size=8, verbose=0)
-    return model
-
-def get_deep_similarity(query_vec, doc_vecs, model):
-    q_proj = model.predict(query_vec.reshape(1, -1), verbose=0)
-    d_proj = model.predict(doc_vecs, verbose=0)
-    return cosine_similarity(q_proj, d_proj).flatten()
+def get_w2v_similarity(query, corpus, model):
+    query_vec = document_vector(query, model).reshape(1, -1)
+    doc_vecs = np.array([document_vector(doc, model) for doc in corpus])
+    return cosine_similarity(query_vec, doc_vecs).flatten()
 
 # ------------------- UI Layout -------------------
 st.title("🔍 Sistem Pencarian Informasi Pariwisata")
+
 query = st.text_input("Masukkan kata kunci pencarian:")
-variant = st.selectbox("Pilih metode pencarian:", ["TF-IDF", "Word2Vec", "Word2Vec + Deep Learning"])
+variant = st.selectbox("Pilih metode pencarian:", ["TF-IDF", "Word2Vec"])
 if variant == "TF-IDF":
-    tfidf_choice = st.selectbox("Varian TF-IDF:", ["Default", "With Bigrams", "Sublinear TF"])
+    tfidf_choice = st.selectbox("Varian TF-IDF:", list(tfidf_options.keys()))
 limit = st.slider("🔢 Jumlah hasil per halaman:", 5, 50, 10, step=5)
 
 categories = sorted(df['Category'].dropna().unique().tolist())
@@ -105,33 +106,22 @@ def highlight_keywords(text, keyword):
 
 # ------------------- Pencarian -------------------
 if query:
-    filtered_df = df[df['Category'].isin(selected_categories) & (df['Price'] <= max_price)].copy()
+    filtered_df = df[
+        df['Category'].isin(selected_categories) & (df['Price'] <= max_price)
+    ].copy()
+
     if filtered_df.empty:
         st.warning("⚠️ Tidak ada data yang sesuai dengan filter.")
     else:
         processed_query = preprocess(query)
-
+        
         if variant == "TF-IDF":
-            tfidf_options = {
-                'Default': TfidfVectorizer(),
-                'With Bigrams': TfidfVectorizer(ngram_range=(1, 2)),
-                'Sublinear TF': TfidfVectorizer(sublinear_tf=True),
-            }
-            vectorizer = tfidf_options[tfidf_choice]
-            tfidf_matrix = vectorizer.fit_transform(filtered_df['cleaned_description'])
+            vectorizer, tfidf_matrix = get_vectorizer_and_matrix(tfidf_choice, filtered_df['cleaned_description'])
             query_vec = vectorizer.transform([processed_query])
             similarity = cosine_similarity(query_vec, tfidf_matrix).flatten()
-
-        else:
+        else:  # Word2Vec
             w2v_model = train_word2vec(filtered_df['cleaned_description'])
-            doc_vecs = np.array([document_vector(doc, w2v_model) for doc in filtered_df['cleaned_description']])
-            query_vec = document_vector(processed_query, w2v_model)
-
-            if variant == "Word2Vec":
-                similarity = cosine_similarity(query_vec.reshape(1, -1), doc_vecs).flatten()
-            else:
-                deep_model = train_embedding_model(doc_vecs)
-                similarity = get_deep_similarity(query_vec, doc_vecs, deep_model)
+            similarity = get_w2v_similarity(processed_query, filtered_df['cleaned_description'], w2v_model)
 
         filtered_df['score'] = similarity
         results = filtered_df[filtered_df['score'] > 0].sort_values(by='score', ascending=False)
