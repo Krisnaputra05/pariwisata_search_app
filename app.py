@@ -5,8 +5,11 @@ import io
 import re
 
 import nltk
+nltk.data.path.append("C:/Users/Lenovo/AppData/Roaming/nltk_data")
 nltk.download('punkt')
+
 from nltk.tokenize import word_tokenize
+
 
 from spellchecker import SpellChecker
 from sklearn.feature_extraction.text import TfidfVectorizer
